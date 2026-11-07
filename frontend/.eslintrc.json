@@ -1,0 +1,52 @@
+{
+  "extends": [
+    "eslint:recommended",
+    "plugin:react/recommended",
+    "plugin:react-hooks/recommended",
+    "plugin:import/recommended"
+  ],
+  "plugins": ["react", "react-hooks", "react-refresh", "i18next", "import"],
+  "settings": {
+    "react": {
+      "version": "detect"
+    }
+  },
+  "rules": {
+    "react-refresh/only-export-components": ["warn", { "allowConstantExport": true }],
+    "import/no-unused-modules": ["error", { "unusedExports": true }],
+    "i18next/no-literal-string": [
+      "warn",
+      {
+        "mode": "jsx-text-only",
+        "should-validate-template": false,
+        "ignore": ["XLM", "kg", "g", "lb", "oz", "unit", "units", "+", "-", "×", "÷", "=", "/", ":", ";", ",", ".", "!", "?", "%", "$", "#", "@", "&", "|", "\\", "(", ")", "[", "]", "{", "}", "<", ">", "~", "`", "^", "*", "_"]
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["src/pages/**/*.jsx", "src/components/**/*.jsx"],
+      "rules": {
+        "i18next/no-literal-string": [
+          "warn",
+          {
+            "mode": "jsx-text-only",
+            "should-validate-template": false,
+            "ignore": ["XLM", "kg", "g", "lb", "oz", "unit", "units"]
+          }
+        ]
+      }
+    }
+  ],
+  "env": {
+    "browser": true,
+    "es2021": true
+  },
+  "parserOptions": {
+    "ecmaVersion": "latest",
+    "sourceType": "module",
+    "ecmaFeatures": {
+      "jsx": true
+    }
+  }
+}

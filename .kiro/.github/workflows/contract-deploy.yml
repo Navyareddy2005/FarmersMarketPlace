@@ -1,0 +1,141 @@
+name: Contract Testnet Deploy + Smoke Test
+
+# #859 — Build the escrow contract Wasm, deploy it to Stellar Testnet, run an
+# end-to-end smoke test (deposit -> release) and verify the result on Horizon.
+#
+# Runs on manual dispatch and on pushes to main that touch the escrow contract.
+# It is intentionally NOT triggered by pull_request: deploying requires the
+# STELLAR_CI_SECRET_KEY secret, which is not exposed to fork PRs.
+on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: Target network (mainnet requires approval via the `mainnet` environment's required reviewers)
+        type: choice
+        options: [testnet, futurenet, mainnet]
+        default: testnet
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/escrow/**'
+      - 'contract/reward-token/**'
+      - 'contracts/creator-earnings/**'
+      - 'contracts/scripts/deploy.sh'
+      - 'contracts/deploy.*.toml'
+      - '.github/workflows/contract-deploy.yml'
+
+env:
+  STELLAR_NETWORK: ${{ inputs.network || 'testnet' }}
+  HORIZON_URL: https://horizon-testnet.stellar.org
+  RPC_URL: https://soroban-testnet.stellar.org
+
+jobs:
+  deploy-and-smoke-test:
+    name: Deploy contracts & Smoke Test
+    runs-on: ubuntu-latest
+    # CT-30: secrets come from GitHub environments; `mainnet` has required reviewers.
+    environment: ${{ inputs.network || 'testnet' }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+            contract/reward-token/target
+          key: ${{ runner.os }}-cargo-escrow-${{ hashFiles('contracts/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-escrow-
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli@22.0.0
+
+      # Acceptance: a CI testnet key is stored as a secret and used to deploy.
+      - name: Guard — require deploy secret
+        env:
+          STELLAR_CI_SECRET_KEY: ${{ secrets.STELLAR_CI_SECRET_KEY }}
+        run: |
+          if [ -z "${STELLAR_CI_SECRET_KEY}" ]; then
+            echo "::error::STELLAR_CI_SECRET_KEY secret is not set; cannot deploy to testnet."
+            exit 1
+          fi
+
+      # Acceptance: deploy, smoke test (deposit 1 XLM -> release), and verify on
+      # Horizon. The job (and therefore the CI run) fails if any step fails.
+      - name: Deploy all contracts (contracts/scripts/deploy.sh)
+        env:
+          STELLAR_SECRET_KEY: ${{ secrets.STELLAR_CI_SECRET_KEY }}
+        run: contracts/scripts/deploy.sh "$STELLAR_NETWORK"
+
+      - name: Commit testnet registry
+        if: env.STELLAR_NETWORK == 'testnet'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deployments/testnet.json
+          git diff --cached --quiet || { git commit -m "chore(deployments): update testnet registry [skip ci]" && git push; }
+
+      - name: Smoke test escrow (deposit -> release)
+        if: env.STELLAR_NETWORK == 'testnet'
+        env:
+          STELLAR_SECRET_KEY: ${{ secrets.STELLAR_CI_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          ACCOUNT_PK="$(stellar keys public-key --secret-key "$STELLAR_SECRET_KEY")"
+          XLM_SAC="$(stellar contract id asset --asset native --network "$STELLAR_NETWORK")"
+          CONTRACT_ID="$(python3 -c 'import json,sys; print(next(e["id"] for e in json.load(open(sys.argv[1])) if e["contract"]=="escrow"))' "deployments/$STELLAR_NETWORK.json")"
+          echo "Escrow contract: $CONTRACT_ID"
+
+          invoke() {
+            stellar contract invoke \
+              --id "$CONTRACT_ID" \
+              --network "$STELLAR_NETWORK" \
+              --source-account "$STELLAR_SECRET_KEY" \
+              -- "$@"
+          }
+
+          ORDER_ID=$(( RANDOM + 1 ))
+          NOW="$(date +%s)"
+          TIMEOUT=$(( NOW + 7200 ))           # 2h ahead (> MIN_TIMEOUT_SECS)
+
+          # Deposit 1 XLM (10_000_000 stroops) into escrow.
+          invoke deposit \
+            --token "$XLM_SAC" \
+            --order_id "$ORDER_ID" \
+            --buyer "$ACCOUNT_PK" \
+            --farmer "$ACCOUNT_PK" \
+            --amount 10000000 \
+            --timeout_unix "$TIMEOUT" \
+            --cooperative_royalty_bps 0 \
+            --release_after_unix 0
+
+          # Release the escrow to the farmer. The fee is read from the value stored
+          # by `initialize` above; `release` takes no fee argument.
+          invoke release --order_id "$ORDER_ID" --caller "$ACCOUNT_PK"
+
+          # On-chain assertion: escrow is now settled.
+          SETTLED="$(invoke is_settled --order_id "$ORDER_ID")"
+          echo "is_settled => $SETTLED"
+          if [ "$SETTLED" != "true" ]; then
+            echo "::error::Escrow $ORDER_ID was not settled after release."
+            exit 1
+          fi
+
+          # Acceptance: verify the transaction on Stellar Testnet via Horizon.
+          LATEST="$(curl -sf "${HORIZON_URL}/accounts/${ACCOUNT_PK}/transactions?order=desc&limit=1")"
+          SUCCESS="$(echo "$LATEST" | python3 -c 'import json,sys; print(json.load(sys.stdin)["_embedded"]["records"][0]["successful"])')"
+          echo "Latest Horizon tx successful => $SUCCESS"
+          if [ "$SUCCESS" != "True" ]; then
+            echo "::error::Most recent Horizon transaction was not successful."
+            exit 1
+          fi
+
+          echo "Smoke test passed: deploy -> deposit -> release -> Horizon verification ✓"

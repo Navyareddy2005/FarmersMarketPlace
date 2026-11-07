@@ -1,0 +1,148 @@
+require('dotenv').config();
+// Express 4 does not forward rejected async route promises by itself.
+require('express-async-errors');
+
+const logger = require('./logger');
+const REQUIRED_ENV = ['JWT_SECRET', 'ENCRYPTION_SECRET'];
+const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
+const weakJwtSecret =
+  process.env.NODE_ENV === 'production' &&
+  Buffer.byteLength(process.env.JWT_SECRET || '', 'utf8') < 32;
+if (missing.length || weakJwtSecret) {
+  logger.error(
+    `[FATAL] ${missing.length
+      ? `Missing required environment variables: ${missing.join(', ')}`
+      : 'JWT_SECRET must be at least 32 bytes in production'}`
+  );
+  logger.error('Copy backend/.env.example to backend/.env and fill in the values.');
+  process.exit(1);
+}
+
+const path = require('path');
+const express = require('express');
+const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const swaggerUi = require('swagger-ui-express');
+const swaggerSpec = require('./swagger');
+const helmet = require('helmet');
+const { enforceHttps, hsts } = require('./middleware/https');
+const { csrfProtect, csrfTokenHandler } = require('./middleware/csrf');
+const { errorHandler, notFoundHandler } = require('./middleware/error');
+const { sanitizeResponse } = require('./middleware/sanitize');
+const requestLogger = require('./middleware/requestLogger');
+const categoriesRouter = require('./routes/categories');
+const db = require('./db/schema');
+
+const app = express();
+
+app.use((req, res, next) => {
+  Promise.resolve(db.ready).then(() => next(), next);
+});
+
+// Configure proxy trust based on environment
+// In production, set TRUST_PROXY to the number of proxies or 'true' for all
+const trustProxy = process.env.TRUST_PROXY || (process.env.NODE_ENV === 'production' ? 1 : false);
+if (trustProxy) {
+  app.set('trust proxy', trustProxy);
+}
+
+app.use(requestLogger);
+app.use(enforceHttps);
+app.use(hsts);
+
+// Configure Helmet with CSP to allow Stellar explorer links
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "blob:"],
+      connectSrc: ["'self'", "https://stellar.expert", "https://horizon-testnet.stellar.org", "https://horizon.stellar.org"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+      upgradeInsecureRequests: process.env.NODE_ENV === 'production' ? [] : null
+    }
+  },
+  hsts: process.env.NODE_ENV === 'production' ? {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  } : false
+}));
+
+const corsOrigins = process.env.CORS_ORIGIN || process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
+const allowedOrigins = corsOrigins.split(',').map((o) => o.trim());
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      const msg = `CORS origin not allowed: ${origin}`;
+      if (process.env.NODE_ENV === 'production') {
+        logger.warn(msg);
+        return callback(new Error('Not allowed by CORS'));
+      }
+      // In non-production environments, log and allow for developer convenience
+      logger.debug(msg);
+      return callback(null, true);
+    },
+    credentials: true,
+  })
+);
+
+app.use(express.json());
+app.use(cookieParser());
+app.use(sanitizeResponse);
+
+// #1360: Serve uploaded files with hardened headers so a stored file can never
+// be interpreted as active content (HTML/SVG) on the API origin. The restrictive
+// CSP, nosniff and inline Content-Disposition with a safe filename neutralise
+// stored-XSS attempts even if a malicious file slips through validation.
+const uploadStaticOptions = {
+  index: false,
+  dotfiles: 'deny',
+  setHeaders: (res, filePath) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader(
+      'Content-Security-Policy',
+      "default-src 'none'; img-src 'self'; media-src 'self'"
+    );
+    const safeName = path.basename(filePath).replace(/[^a-zA-Z0-9._-]/g, '_');
+    res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
+  },
+};
+app.use('/uploads', express.static(path.join(__dirname, '../uploads'), uploadStaticOptions));
+app.use('/uploads/videos', express.static(path.join(__dirname, '../uploads/videos'), uploadStaticOptions));
+
+app.get('/api/csrf-token', csrfTokenHandler);
+app.get('/api/v1/csrf-token', csrfTokenHandler);
+// #836: Also expose at /api/auth/csrf-token for SPA initialization (duplicated for discoverability).
+app.get('/api/auth/csrf-token', csrfTokenHandler);
+// #1357: categories is mounted only through registerRoute in ./routes so it
+// goes through the same rate limiter and CSRF ordering as every other router.
+
+// Interactive API documentation
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+// Apply CSRF protection to all state-changing routes (skip in test)
+if (process.env.NODE_ENV !== 'test') {
+  app.use(csrfProtect);
+}
+
+app.use(require('./routes'));
+app.use(notFoundHandler);
+app.use(errorHandler);
+
+// Background jobs are started from src/index.js via jobs/index.js (#1367), never on import.
+app.locals.startBackgroundJobs = () => {
+  if (process.env.NODE_ENV === 'test') return;
+  const { startActivityMonitor } = require('./jobs/activityMonitor');
+  startActivityMonitor();
+  const { startOrphanedUploadsCleanupJob } = require('./jobs/reconcileOrphanedUploads');
+  startOrphanedUploadsCleanupJob();
+};
+
+module.exports = app;

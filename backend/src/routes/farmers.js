@@ -1,0 +1,208 @@
+const router = require('express').Router();
+const db = require('../db/schema');
+const auth = require('../middleware/auth');
+const validate = require('../middleware/validate');
+const { err } = require('../middleware/error');
+const { sanitizeText } = require('../utils/sanitize');
+const crypto = require('crypto');
+const { webhookMiddleware } = require('../services/webhookVerify');
+
+const PUBLIC_FIELDS =
+  'u.id, u.name, u.bio, u.location, u.avatar_url, u.created_at, u.latitude, u.longitude, u.farm_address, u.verification_status';
+  'u.id, u.name, u.bio, u.location, u.avatar_url, u.created_at, u.latitude, u.longitude, u.farm_address, u.verified';
+
+// GET /api/farmers/:id
+router.get('/:id', async (req, res) => {
+  const { rows } = await db.query(
+    `SELECT ${PUBLIC_FIELDS} FROM users u WHERE u.id = $1 AND u.role = 'farmer'`,
+    [req.params.id]
+  );
+  if (!rows[0]) return err(res, 404, 'Farmer not found', 'not_found');
+
+  const { rows: listings } = await db.query(
+    `SELECT id, name, description, category, price, quantity, unit, image_url, created_at
+     FROM products WHERE farmer_id = $1 AND quantity > 0 ORDER BY created_at DESC`,
+    [req.params.id]
+  );
+  const { rows: cooperatives } = await db.query(
+    `SELECT c.id, c.name FROM cooperatives c
+     JOIN cooperative_members cm ON cm.cooperative_id = c.id
+     WHERE cm.user_id = $1`,
+    [req.params.id]
+  );
+  const { verification_status, ...farmer } = rows[0];
+  res.json({
+    success: true,
+    data: { ...farmer, verified: verification_status === 'verified', cooperatives, listings },
+  });
+  const { rewriteImageUrl } = require('../utils/cdn');
+  const listingsWithImages = listings.map((l) => ({ ...l, image_url: rewriteImageUrl(l.image_url) }));
+  res.json({ success: true, data: { ...rows[0], listings: listingsWithImages } });
+});
+
+// PATCH /api/farmers/me
+router.patch('/me', auth, validate.farmerProfile, async (req, res) => {
+  if (req.user.role !== 'farmer')
+    return err(res, 403, 'Only farmers can update a farmer profile', 'forbidden');
+
+  const { bio, location, avatar_url, federation_name, latitude, longitude, farm_address } =
+    req.body;
+  const updates = [];
+  const params = [];
+
+  if (bio !== undefined) {
+    updates.push(`bio = $${params.length + 1}`);
+    params.push(bio ? sanitizeText(bio) : null);
+  }
+  if (location !== undefined) {
+    updates.push(`location = $${params.length + 1}`);
+    params.push(location ? sanitizeText(location) : null);
+  }
+  if (avatar_url !== undefined) {
+    updates.push(`avatar_url = $${params.length + 1}`);
+    params.push(avatar_url || null);
+  }
+  if (farm_address !== undefined) {
+    updates.push(`farm_address = $${params.length + 1}`);
+    params.push(farm_address ? sanitizeText(farm_address) : null);
+  }
+  if (latitude !== undefined) {
+    const lat = latitude === null ? null : parseFloat(latitude);
+    if (lat !== null && (isNaN(lat) || lat < -90 || lat > 90))
+      return err(res, 400, 'Invalid latitude', 'validation_error');
+    updates.push(`latitude = $${params.length + 1}`);
+    params.push(lat);
+  }
+  if (longitude !== undefined) {
+    const lng = longitude === null ? null : parseFloat(longitude);
+    if (lng !== null && (isNaN(lng) || lng < -180 || lng > 180))
+      return err(res, 400, 'Invalid longitude', 'validation_error');
+    updates.push(`longitude = $${params.length + 1}`);
+    params.push(lng);
+  }
+  if (federation_name !== undefined) {
+    const name = federation_name ? federation_name.toLowerCase().trim() : null;
+    if (name && !/^[a-z0-9._-]{1,64}$/.test(name))
+      return err(
+        res,
+        400,
+        'Federation name may only contain lowercase letters, numbers, dots, hyphens, underscores (max 64 chars)',
+        'validation_error'
+      );
+    if (name) {
+      const { rows } = await db.query(
+        'SELECT id FROM users WHERE federation_name = $1 AND id != $2',
+        [name, req.user.id]
+      );
+      if (rows[0]) return err(res, 409, 'Federation name already taken', 'conflict');
+    }
+    updates.push(`federation_name = $${params.length + 1}`);
+    params.push(name);
+  }
+
+  if (updates.length === 0)
+    return res
+      .status(400)
+      .json({ success: false, message: 'No fields to update', code: 'no_changes' });
+
+  params.push(req.user.id);
+  await db.query(`UPDATE users SET ${updates.join(', ')} WHERE id = $${params.length}`, params);
+
+  const { rows } = await db.query(
+    `SELECT ${PUBLIC_FIELDS}, federation_name FROM users u WHERE u.id = $1`,
+    [req.user.id]
+  );
+  res.json({ success: true, data: rows[0] });
+});
+
+// POST /api/farmers/verify - Submit verification documents
+router.post('/verify', auth, async (req, res) => {
+  if (req.user.role !== 'farmer') {
+    return err(res, 403, 'Only farmers can submit verification', 'forbidden');
+  }
+
+  const { document_urls } = req.body;
+  if (!document_urls || !Array.isArray(document_urls) || document_urls.length === 0) {
+    return err(res, 400, 'document_urls array is required', 'validation_error');
+  }
+
+  // Store as JSON string
+  const docsJson = JSON.stringify(document_urls);
+
+  await db.query(
+    'UPDATE users SET verification_status = $1, verification_docs = $2 WHERE id = $3',
+    ['pending', docsJson, req.user.id]
+  );
+
+  res.json({ success: true, message: 'Verification submitted for review' });
+});
+
+// POST /api/farmers/webhook-secret/rotate — generate a new webhook secret
+router.post('/webhook-secret/rotate', auth, async (req, res) => {
+  if (req.user.role !== 'farmer')
+    return err(res, 403, 'Only farmers can rotate webhook secrets', 'forbidden');
+
+  const secret = crypto.randomBytes(32).toString('hex');
+  await db.query('UPDATE users SET webhook_secret = $1 WHERE id = $2', [secret, req.user.id]);
+  res.json({ success: true, webhook_secret: secret });
+});
+
+// POST /api/farmers/:farmerId/webhook — receive an incoming webhook (HMAC-verified)
+router.post(
+  '/:farmerId/webhook',
+  webhookMiddleware(async (req) => {
+    const { rows } = await db.query(
+      'SELECT webhook_secret FROM users WHERE id = $1 AND role = $2',
+      [req.params.farmerId, 'farmer']
+    );
+    return rows[0]?.webhook_secret || null;
+  }),
+  (req, res) => {
+    res.json({ success: true, received: true });
+  }
+);
+
+// GET /api/farmers/:id/carbon-offsets — total verified kg CO2 across the farmer's orders (#1503).
+// Voided offsets read back as empty from `get_offset`; amended ones return the current value.
+const CARBON_TOTAL_TTL_MS = 10 * 60 * 1000;
+const CARBON_MAX_ORDERS = 200;
+const carbonTotalCache = new Map();
+
+router.get('/:id/carbon-offsets', async (req, res) => {
+  const farmerId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(farmerId) || farmerId <= 0) return err(res, 400, 'Invalid farmer id', 'validation_error');
+  const contractId = process.env.SOROBAN_CARBON_OFFSET_CONTRACT_ID || null;
+  if (!contractId) return res.json({ success: true, data: { configured: false, totalKgCo2: 0, orderCount: 0 } });
+
+  const cached = carbonTotalCache.get(farmerId);
+  if (cached && cached.expires > Date.now()) return res.json({ success: true, data: cached.data });
+
+  const { rows: orders } = await db.query(
+    `SELECT o.id FROM orders o JOIN products p ON o.product_id = p.id
+     WHERE p.farmer_id = $1 AND o.status IN ('paid', 'processing', 'shipped', 'delivered')
+     ORDER BY o.created_at DESC LIMIT ${CARBON_MAX_ORDERS}`,
+    [farmerId]
+  );
+
+  const { getCarbonOffset } = require('../utils/stellar');
+  let totalKgCo2 = 0;
+  let orderCount = 0;
+  for (let i = 0; i < orders.length; i += 10) {
+    const results = await Promise.allSettled(orders.slice(i, i + 10).map((o) => getCarbonOffset(o.id)));
+    for (const r of results) {
+      if (r.status !== 'fulfilled' || !r.value) continue;
+      const offset = typeof r.value === 'object' && 'success' in r.value ? (r.value.success ? r.value.result : null) : r.value;
+      const kg = Number(offset?.kg_co2);
+      if (offset && Number.isFinite(kg) && kg > 0) {
+        totalKgCo2 += kg;
+        orderCount += 1;
+      }
+    }
+  }
+
+  const data = { configured: true, contractId, totalKgCo2, orderCount, ordersScanned: orders.length };
+  carbonTotalCache.set(farmerId, { data, expires: Date.now() + CARBON_TOTAL_TTL_MS });
+  res.json({ success: true, data });
+});
+
+module.exports = router;

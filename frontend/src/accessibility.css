@@ -1,0 +1,51 @@
+/* "Skip to main content" link: the first focusable element on every page.
+   Visually hidden off-screen until it receives keyboard focus, so sighted
+   mouse users never see it but keyboard users can Tab straight to it. */
+.skip-link {
+  position: absolute;
+  top: -100px;
+  left: 0;
+  z-index: 1000;
+  background: #1b4332;
+  color: #fff;
+  padding: 12px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 0 0 6px 0;
+  transition: top 0.15s ease-in-out;
+}
+
+.skip-link:focus {
+  top: 0;
+  outline: 3px solid #95d5b2;
+  outline-offset: 2px;
+}
+
+/* Visually hidden but still read by screen readers (#1502). */
+.sr-only {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* "Skip map" link inside MapView: hidden until focused, then shown over the map. */
+.skip-link--map:not(:focus) {
+  top: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+}
+.skip-link--map:focus {
+  top: 8px;
+  left: 8px;
+  border-radius: 6px;
+}

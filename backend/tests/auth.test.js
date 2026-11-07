@@ -1,0 +1,326 @@
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { request, app, mockQuery, getCsrf } = require('./setup');
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
+});
+
+const SECRET = process.env.JWT_SECRET || 'test-secret-for-jest';
+const VALID_PASSWORD = 'Secure1pass';
+
+describe('POST /api/auth/register', () => {
+  it('registers a new user, returns access token and sets refresh cookie', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [{ id: 1 }], rowCount: 1 });
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+    const res = await request(app).post('/api/auth/register').send({
+      name: 'Alice',
+      email: 'alice@test.com',
+      password: VALID_PASSWORD,
+      role: 'farmer',
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.token).toBeDefined();
+    expect(res.body.user.role).toBe('farmer');
+    const cookie = res.headers['set-cookie']?.[0] || '';
+    expect(cookie).toMatch(/refreshToken=/);
+    expect(cookie).toMatch(/HttpOnly/i);
+  });
+
+  it('returns 409 on duplicate email', async () => {
+    mockQuery.mockRejectedValueOnce(
+      Object.assign(new Error('UNIQUE constraint failed'), { code: '23505' })
+    );
+
+    const res = await request(app).post('/api/auth/register').send({
+      name: 'Bob',
+      email: 'bob@test.com',
+      password: VALID_PASSWORD,
+      role: 'buyer',
+    });
+    expect(res.status).toBe(409);
+  });
+
+  it('returns 400 for invalid role', async () => {
+    const res = await request(app).post('/api/auth/register').send({
+      name: 'X',
+      email: 'x@test.com',
+      password: VALID_PASSWORD,
+      role: 'admin',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 for password shorter than 8 chars', async () => {
+    const res = await request(app).post('/api/auth/register').send({
+      name: 'Y',
+      email: 'y@test.com',
+      password: 'Short1',
+      role: 'farmer',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 for password missing uppercase', async () => {
+    const res = await request(app).post('/api/auth/register').send({
+      name: 'Y',
+      email: 'y@test.com',
+      password: 'nouppercase1',
+      role: 'farmer',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 for password missing number', async () => {
+    const res = await request(app).post('/api/auth/register').send({
+      name: 'Y',
+      email: 'y@test.com',
+      password: 'NoNumberHere',
+      role: 'farmer',
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 for a common weak password', async () => {
+    const res = await request(app).post('/api/auth/register').send({
+      name: 'Y',
+      email: 'y@test.com',
+      password: 'Password1',
+      role: 'farmer',
+    });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('POST /api/auth/login', () => {
+  it('logs in with correct credentials, returns access token and sets refresh cookie', async () => {
+    const hashed = await bcrypt.hash(VALID_PASSWORD, 12);
+    mockQuery.mockResolvedValueOnce({
+      rows: [{
+        id: 1,
+        name: 'Carol',
+        email: 'carol@test.com',
+        password: hashed,
+        role: 'buyer',
+        stellar_public_key: 'GPUB',
+      }],
+      rowCount: 1,
+    });
+    // SELECT user_2fa_settings (2FA disabled)
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+    // INSERT refresh_token
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'carol@test.com', password: VALID_PASSWORD });
+
+    expect(res.status).toBe(200);
+    expect(res.body.token).toBeDefined();
+    const decoded = jwt.verify(res.body.token, SECRET);
+    expect(decoded.id).toBe(1);
+    const cookie = res.headers['set-cookie']?.[0] || '';
+    expect(cookie).toMatch(/refreshToken=/);
+    expect(cookie).toMatch(/HttpOnly/i);
+  });
+
+  it('returns 401 for wrong password', async () => {
+    const hashed = await bcrypt.hash(VALID_PASSWORD, 12);
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: 1, password: hashed, role: 'buyer' }],
+      rowCount: 1,
+    });
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'carol@test.com', password: 'wrongpass' });
+
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 401 for unknown email', async () => {
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'nobody@test.com', password: VALID_PASSWORD });
+
+    expect(res.status).toBe(401);
+  });
+
+  it('returns mfa_required and no session tokens when 2FA is enabled', async () => {
+    const hashed = await bcrypt.hash(VALID_PASSWORD, 12);
+    // SELECT user
+    mockQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          id: 1,
+          name: 'Carol',
+          email: 'carol@test.com',
+          password: hashed,
+          role: 'buyer',
+          stellar_public_key: 'GPUB',
+        },
+      ],
+      rowCount: 1,
+    });
+    // SELECT user_2fa_settings (2FA enabled)
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ user_id: 1, enabled: 1, secret: 'JBSWY3DPEHPK3PXP' }],
+      rowCount: 1,
+    });
+
+    const res = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'carol@test.com', password: VALID_PASSWORD });
+    expect(res.status).toBe(200);
+    expect(res.body.mfa_required).toBe(true);
+    expect(res.body.mfa_token).toBeDefined();
+    expect(res.body.token).toBeUndefined();
+    const cookie = res.headers['set-cookie']?.[0] || '';
+    expect(cookie).not.toMatch(/refreshToken=/);
+
+    const decoded = jwt.verify(res.body.mfa_token, SECRET);
+    expect(decoded.scope).toBe('mfa');
+    expect(decoded.id).toBe(1);
+  });
+});
+
+describe('POST /api/auth/2fa/login', () => {
+  it('issues session tokens for a valid TOTP code', async () => {
+    const mfaToken = jwt.sign({ id: 1, scope: 'mfa' }, SECRET, { expiresIn: '5m' });
+    // SELECT user_2fa_settings
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ user_id: 1, enabled: 1, secret: 'JBSWY3DPEHPK3PXP' }],
+      rowCount: 1,
+    });
+    // SELECT user
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: 1, name: 'Carol', email: 'carol@test.com', role: 'buyer', stellar_public_key: 'GPUB' }],
+      rowCount: 1,
+    });
+    // INSERT refresh_token
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+    const res = await request(app)
+      .post('/api/auth/2fa/login')
+      .send({ mfa_token: mfaToken, code: '123456' });
+    expect(res.status).toBe(200);
+    expect(res.body.token).toBeDefined();
+    const cookie = res.headers['set-cookie']?.[0] || '';
+    expect(cookie).toMatch(/refreshToken=/);
+  });
+
+  it('rejects a reused backup code', async () => {
+    const mfaToken = jwt.sign({ id: 1, scope: 'mfa' }, SECRET, { expiresIn: '5m' });
+    // SELECT user_2fa_settings
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ user_id: 1, enabled: 1, secret: 'JBSWY3DPEHPK3PXP' }],
+      rowCount: 1,
+    });
+    // SELECT backup codes — none unused match
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+    const res = await request(app)
+      .post('/api/auth/2fa/login')
+      .send({ mfa_token: mfaToken, code: 'BACKUP-CODE' });
+    expect(res.status).toBe(401);
+    expect(res.body.token).toBeUndefined();
+  });
+});
+
+describe('POST /api/auth/2fa/disable', () => {
+  it('rejects disabling 2FA without a code', async () => {
+    const token = jwt.sign({ id: 1, role: 'buyer' }, SECRET, { expiresIn: '15m' });
+
+    const res = await request(app)
+      .post('/api/auth/2fa/disable')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ password: VALID_PASSWORD });
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('POST /api/auth/refresh', () => {
+  it('returns 401 when no refresh cookie is present', async () => {
+    const { token: csrf, cookieStr } = await getCsrf();
+    const res = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', cookieStr)
+      .set('X-CSRF-Token', csrf);
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 401 for an invalid/unknown refresh token', async () => {
+    const { token: csrf, cookieStr } = await getCsrf();
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 0 });
+
+    const res = await request(app)
+      .post('/api/auth/refresh')
+      .set('Cookie', `${cookieStr}; refreshToken=invalidtoken`)
+      .set('X-CSRF-Token', csrf);
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('PATCH /api/auth/password', () => {
+  it('updates the current password and allows login with the new password', async () => {
+    const oldHash = await bcrypt.hash('OldPass1', 12);
+    const token = jwt.sign({ id: 1, role: 'buyer' }, SECRET, { expiresIn: '15m' });
+
+    mockQuery
+      .mockResolvedValueOnce({ rows: [{ id: 1, active: 1 }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [{ id: 1, password: oldHash }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [], rowCount: 1 })
+      .mockResolvedValueOnce({
+        rows: [{
+          id: 1,
+          name: 'Carol',
+          email: 'carol@test.com',
+          password: await bcrypt.hash('NewSecure1', 12),
+          role: 'buyer',
+          stellar_public_key: 'GPUB',
+        }],
+        rowCount: 1,
+      })
+      .mockResolvedValueOnce({ rows: [{ id: 1, name: 'Carol', email: 'carol@test.com', password: newHash, role: 'buyer', stellar_public_key: 'GPUB' }], rowCount: 1 })
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 })
+      .mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+    const updateRes = await request(app)
+      .patch('/api/auth/password')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ current_password: 'OldPass1', new_password: 'NewSecure1' });
+
+    expect(updateRes.status).toBe(200);
+    expect(updateRes.body.ok).toBe(true);
+
+    const loginRes = await request(app)
+      .post('/api/auth/login')
+      .send({ email: 'carol@test.com', password: 'NewSecure1' });
+
+    expect(loginRes.status).toBe(200);
+    expect(loginRes.body.token).toBeDefined();
+  });
+});
+
+describe('POST /api/auth/logout', () => {
+  it('clears the refresh cookie on logout', async () => {
+    const { token: csrf, cookieStr } = await getCsrf();
+    mockQuery.mockResolvedValueOnce({ rows: [], rowCount: 1 });
+
+    const res = await request(app)
+      .post('/api/auth/logout')
+      .set('Cookie', `${cookieStr}; refreshToken=sometoken`)
+      .set('X-CSRF-Token', csrf);
+
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    const cookie = res.headers['set-cookie']?.[0] || '';
+    expect(cookie).toMatch(/refreshToken=/);
+  });
+});

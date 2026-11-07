@@ -1,0 +1,109 @@
+const crypto = require('crypto');
+
+const CSRF_COOKIE = 'csrf_token';
+const CSRF_HEADER = 'x-csrf-token';
+
+// Routes that are exempt from CSRF validation (pre-auth endpoints).
+// Expressed as path suffixes (i.e. with the /api or /api/v1 prefix
+// stripped) so the same list covers every registered API version (#990).
+//
+// The frontend mirrors this list in CSRF_EXEMPT (frontend/src/api/client.js)
+// because it builds in a disjoint Docker context and cannot import this file;
+// backend/tests/csrf.test.js fails if the two ever drift (#1381).
+//
+// /auth/refresh and /auth/logout are exempt because the SPA's
+// refreshAccessToken()/logout() calls do not send an X-CSRF-Token header.
+// They are instead protected by the SameSite=Strict refresh-token cookie
+// (which browsers refuse to attach to cross-site requests) plus an Origin
+// check in the auth routes, so CSRF validation here would be redundant (#1363).
+const EXEMPT_SUFFIXES = [
+  '/auth/login',
+  '/auth/register',
+  '/auth/recover',
+  '/auth/refresh',
+  '/auth/logout',
+];
+
+/**
+ * Strips a leading /api/v1 or /api prefix so exemption checks are
+ * version-agnostic — a new API prefix can't silently bypass this list.
+ */
+function stripApiPrefix(path) {
+  if (path.startsWith('/api/v1/')) return path.slice('/api/v1'.length);
+  if (path.startsWith('/api/')) return path.slice('/api'.length);
+  return path;
+}
+
+/**
+ * Generates a fresh CSRF token and sets it as a readable (non-httpOnly) cookie.
+ * Exported so it can be called from the login handler to rotate the token on
+ * every login, preventing token-fixation attacks. (#836)
+ */
+function generateCsrfToken(res) {
+  const token = crypto.randomBytes(32).toString('hex');
+  res.cookie(CSRF_COOKIE, token, {
+    httpOnly: false, // must be readable by JS so the client can send it as a header
+    sameSite: 'Strict',
+    secure: process.env.NODE_ENV === 'production',
+    maxAge: 24 * 60 * 60 * 1000, // 24 hours
+  });
+  return token;
+}
+
+/**
+ * Generates a CSRF token, sets it as a readable cookie, and exposes it in the response.
+ * GET /api/csrf-token  (also mounted at GET /api/auth/csrf-token for SPA init — #836)
+ */
+function csrfTokenHandler(req, res) {
+  const token = generateCsrfToken(res);
+  res.json({ csrfToken: token });
+}
+
+/**
+ * Middleware that validates the CSRF token on all state-changing requests.
+ * Compares the X-CSRF-Token header against the csrf_token cookie.
+ * Applied globally via app.use() to all non-GET routes (#836).
+ */
+function csrfProtect(req, res, next) {
+  const method = req.method.toUpperCase();
+
+  // Only validate state-changing methods
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) return next();
+
+  // Skip CSRF in test environment
+  if (process.env.NODE_ENV === 'test') return next();
+
+  // Exempt pre-auth routes
+  if (EXEMPT_SUFFIXES.includes(stripApiPrefix(req.path))) return next();
+
+  const cookieHeader = req.headers.cookie || '';
+  const cookieToken = parseCookie(cookieHeader, CSRF_COOKIE);
+  const headerToken = req.headers[CSRF_HEADER];
+
+  if (!cookieToken || !headerToken) {
+    return res.status(403).json({ error: 'CSRF token missing' });
+  }
+
+  // Constant-time comparison to prevent timing attacks
+  const cookieBuf = Buffer.from(cookieToken);
+  const headerBuf = Buffer.from(headerToken);
+
+  if (cookieBuf.length !== headerBuf.length || !crypto.timingSafeEqual(cookieBuf, headerBuf)) {
+    return res.status(403).json({ error: 'CSRF token invalid' });
+  }
+
+  next();
+}
+
+/**
+ * Minimal cookie parser — avoids adding a dependency just for this.
+ */
+function parseCookie(cookieStr, name) {
+  for (const part of cookieStr.split(';')) {
+    const [key, ...rest] = part.trim().split('=');
+    if (key.trim() === name) return rest.join('=').trim();
+  }
+  return null;
+}
+
+module.exports = { csrfProtect, csrfTokenHandler, generateCsrfToken, EXEMPT_SUFFIXES };
